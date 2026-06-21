@@ -1,0 +1,29 @@
+# Core UI
+streamlit>=1.35.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# PDF extraction
+# Note: camelot-py requires ghostscript system package: apt-get install ghostscript
+pdfplumber>=0.11.0
+camelot-py[cv]>=0.11.0
+
+# HTML parsing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.2.0
+
+# Data + finance
+yfinance>=0.2.40
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Charts
+plotly>=5.22.0
+
+# AI
+anthropic>=0.28.0
+
+# Config
+python-dotenv>=1.0.0
