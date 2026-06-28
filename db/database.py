@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from db.models import Base
 
@@ -21,3 +21,16 @@ def get_session_factory(engine):
 
 def init_db(engine):
     Base.metadata.create_all(engine)
+
+
+def run_migrations(engine):
+    """Apply incremental schema changes to an existing database."""
+    with engine.connect() as conn:
+        for stmt in [
+            "ALTER TABLE companies ADD COLUMN is_listed BOOLEAN NOT NULL DEFAULT 1",
+        ]:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists

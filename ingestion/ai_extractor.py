@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import anthropic
@@ -13,10 +14,11 @@ def _get_client() -> anthropic.Anthropic:
 
 
 LINE_TYPES = [
-    "revenue", "ebitda", "operating_profit", "net_profit",
-    "eps_reported", "eps_adjusted", "net_debt", "operating_cash_flow",
-    "capex", "free_cash_flow", "dps", "shares_outstanding",
-    "capital_employed", "interest_expense", "nav_per_share",
+    "revenue", "ebitda", "operating_profit", "adjusted_operating_profit",
+    "finance_income", "profit_before_tax", "net_profit",
+    "eps_reported", "eps_adjusted", "eps_adjusted_diluted",
+    "net_debt", "operating_cash_flow", "capex", "free_cash_flow",
+    "dps", "shares_outstanding", "capital_employed", "interest_expense", "nav_per_share",
 ]
 
 
@@ -71,6 +73,64 @@ Return only the JSON object, no commentary."""
 
     if not result.get("is_financial"):
         return None
+    return result
+
+
+def propose_mapping_from_image(image_bytes: bytes, ticker: str, doc_type: str) -> dict | None:
+    """Extract financial data by sending the page image directly to Claude vision.
+
+    Returns the same shape as propose_mapping, plus 'extracted_rows' with actual values.
+    """
+    img_b64 = base64.standard_b64encode(image_bytes).decode()
+    prompt = f"""Extract financial table data from this page of a {doc_type} report for {ticker}.
+
+Available line types: {", ".join(LINE_TYPES)}
+
+If the page contains a financial results table (P&L, cash flow, or balance sheet), return JSON:
+{{
+  "is_financial": true,
+  "period_columns": ["2025", "2024"],
+  "extracted_rows": [
+    {{"label": "Revenue", "line_type": "revenue", "values": {{"2025": 54436, "2024": 45309}}}},
+    {{"label": "Operating profit", "line_type": "operating_profit", "values": {{"2025": 12345, "2024": 10000}}}}
+  ]
+}}
+
+Rules:
+- period_columns: column headers exactly as shown (years, half-year labels, etc.)
+- label: exact row label text as it appears
+- line_type: one of the available types, or null if no suitable match
+- values: numbers only — strip commas, convert parentheses to negative e.g. (1,234) → -1234
+- Only include rows you can match to a line_type
+
+If no financial table on this page return: {{"is_financial": false}}
+Return only valid JSON, no commentary."""
+
+    client = _get_client()
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+            {"type": "text", "text": prompt},
+        ]}],
+    )
+    text = response.content[0].text.strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}") + 1
+        if start >= 0 and end > start:
+            result = json.loads(text[start:end])
+        else:
+            return None
+    if not result.get("is_financial"):
+        return None
+    result["row_mappings"] = {
+        r["label"]: r["line_type"]
+        for r in result.get("extracted_rows", [])
+        if r.get("line_type")
+    }
     return result
 
 

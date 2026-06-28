@@ -30,9 +30,13 @@ class LineType(enum.Enum):
     revenue = "revenue"
     ebitda = "ebitda"
     operating_profit = "operating_profit"
+    adjusted_operating_profit = "adjusted_operating_profit"
+    finance_income = "finance_income"
+    profit_before_tax = "profit_before_tax"
     net_profit = "net_profit"
     eps_reported = "eps_reported"
     eps_adjusted = "eps_adjusted"
+    eps_adjusted_diluted = "eps_adjusted_diluted"
     net_debt = "net_debt"
     operating_cash_flow = "operating_cash_flow"
     capex = "capex"
@@ -70,6 +74,7 @@ class Company(Base):
     blacklisted = Column(Boolean, default=False)
     in_watchlist = Column(Boolean, default=False)
     in_portfolio = Column(Boolean, default=False)
+    is_listed = Column(Boolean, default=True, nullable=False, server_default="1")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     documents = relationship("Document", back_populates="company")

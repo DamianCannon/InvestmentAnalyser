@@ -8,6 +8,7 @@ sqlalchemy>=2.0.0
 # Note: camelot-py requires ghostscript system package: apt-get install ghostscript
 pdfplumber>=0.11.0
 camelot-py[cv]>=0.11.0
+pymupdf>=1.24.0
 
 # HTML parsing
 requests>=2.31.0

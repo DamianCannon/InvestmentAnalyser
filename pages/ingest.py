@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 from db.database import get_engine, get_session_factory
 from db.models import (
@@ -12,7 +13,8 @@ from db.models import (
 )
 from ingestion import ai_extractor, mapping_store
 from ingestion.html_parser import fetch_and_parse
-from ingestion.pdf_parser import extract_tables
+from ingestion.pdf_parser import extract_tables, filter_junk_tables, render_page
+from pages.ui_helpers import linked_company_selector, form_company_selectbox
 
 st.title("Ingest Documents")
 
@@ -23,7 +25,14 @@ LINE_TYPES = [lt.value for lt in LineType]
 DOC_TYPES = [dt.value for dt in DocumentType]
 
 with Session() as session:
-    tickers = [c.ticker for c in session.query(Company).order_by(Company.ticker).all()]
+    _all_cos = session.query(Company).order_by(Company.ticker).all()
+    tickers = [c.ticker for c in _all_cos]
+
+    class _Co:
+        __slots__ = ("ticker", "name")
+        def __init__(self, t, n): self.ticker, self.name = t, n
+
+    companies = [_Co(c.ticker, c.name or c.ticker) for c in _all_cos]
 
 if not tickers:
     st.warning("No companies found. Add a company ticker first.")
@@ -49,8 +58,47 @@ if not tickers:
 tab_pdf, tab_html, tab_add_company = st.tabs(["PDF Upload", "URL / HTML", "Add Company"])
 
 with tab_add_company:
+    st.subheader("Search to add")
+    st.caption("Type a company name or ticker — results are filtered to LSE-listed securities.")
+    search_q = st.text_input("Search", placeholder="e.g. Tatton, Smith & Nephew, TAM.L", key="yf_search_q")
+    if st.button("Search", key="yf_search_btn") and search_q:
+        with st.spinner("Searching yfinance…"):
+            try:
+                results = yf.Search(search_q, news_count=0).quotes
+                lse_hits = [
+                    q for q in results
+                    if str(q.get("symbol", "")).endswith(".L")
+                    or q.get("exchange") in ("LSE", "AIM", "IOB")
+                ]
+                st.session_state["yf_results"] = lse_hits
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+                st.session_state["yf_results"] = []
+
+    for q in st.session_state.get("yf_results", []):
+        symbol = q.get("symbol", "")
+        name = q.get("shortname") or q.get("longname", symbol)
+        exch = q.get("exchDisp", q.get("exchange", ""))
+        r1, r2, r3 = st.columns([4, 2, 1])
+        r1.write(f"**{symbol}** — {name}")
+        r2.caption(exch)
+        if r3.button("Add", key=f"yf_add_{symbol}"):
+            with Session() as session:
+                if not session.get(Company, symbol):
+                    session.add(Company(
+                        ticker=symbol,
+                        name=name,
+                        company_type=CompanyType.equity,
+                        is_listed=True,
+                    ))
+                    session.commit()
+            st.success(f"Added {symbol} — {name}")
+            st.session_state["yf_results"] = []
+            st.rerun()
+
+    st.divider()
+    st.subheader("Manual add / update")
     with st.form("add_company"):
-        st.write("**Add / update company**")
         c1, c2 = st.columns(2)
         new_ticker = c1.text_input("Ticker (e.g. SMWH.L)").strip().upper()
         new_name = c2.text_input("Company name")
@@ -59,7 +107,7 @@ with tab_add_company:
         new_market = c4.text_input("Market (e.g. LSE Main)")
         new_type = c5.selectbox("Type", ["equity", "investment_trust"])
         if st.form_submit_button("Save") and new_ticker and new_name:
-            from db.models import CompanyType
+            from db.models import CompanyType as _CT
             with Session() as session:
                 existing = session.get(Company, new_ticker)
                 if existing:
@@ -72,48 +120,81 @@ with tab_add_company:
                         name=new_name,
                         sector=new_sector or None,
                         market=new_market or None,
-                        company_type=CompanyType(new_type),
+                        company_type=_CT(new_type),
+                        is_listed=True,
                     ))
                 session.commit()
             st.success(f"Saved {new_ticker}")
             st.rerun()
 
 
-def _run_review_ui(tables, doc_type, ticker, document_id, session_factory):
+def _safe_dataframe(headers: list, rows: list) -> pd.DataFrame:
+    """Build a DataFrame, deduplicating column names to avoid Arrow serialisation errors."""
+    if rows and headers and len(headers) == len(rows[0]):
+        seen: dict[str, int] = {}
+        deduped = []
+        for h in headers:
+            if h in seen:
+                seen[h] += 1
+                deduped.append(f"{h}.{seen[h]}")
+            else:
+                seen[h] = 0
+                deduped.append(h)
+        return pd.DataFrame(rows, columns=deduped)
+    return pd.DataFrame(rows)
+
+
+def _run_review_ui(tables, doc_type, ticker, document_id, session_factory, file_bytes=None):
     if not tables:
         st.warning("No tables extracted from document.")
         return
 
-    st.write(f"**{len(tables)} table(s) extracted.** Review and confirm mappings.")
+    st.write(f"**{len(tables)} table(s) selected.** Review AI proposals and confirm.")
 
     with session_factory() as session:
         existing_mapping = mapping_store.get_mapping(session, ticker, doc_type)
 
     for tbl in tables:
         idx = tbl["index"]
+        page_num_0 = tbl.get("page", 1) - 1
+        st.markdown(f"---\n#### Table {idx + 1} (page {tbl.get('page', '?')})")
+
+        mapping_key = f"mapping_{document_id}_{idx}"
+        if mapping_key not in st.session_state:
+            with st.spinner("Asking AI for mapping…"):
+                if file_bytes:
+                    img = render_page(file_bytes, page_num_0)
+                    proposal = ai_extractor.propose_mapping_from_image(img, ticker, doc_type) if img else None
+                    if proposal and "extracted_rows" in proposal:
+                        period_cols = proposal["period_columns"]
+                        tbl["headers"] = [""] + period_cols
+                        tbl["rows"] = [
+                            [r["label"]] + [str(r["values"].get(p, "")) for p in period_cols]
+                            for r in proposal["extracted_rows"]
+                        ]
+                else:
+                    proposal = ai_extractor.propose_mapping(tbl, ticker, doc_type)
+                st.session_state[mapping_key] = proposal or {}
+
+        proposal = st.session_state[mapping_key]
+
         headers = tbl.get("headers", [])
         rows = tbl.get("rows", [])
-        st.markdown(f"---\n#### Table {idx + 1} (page {tbl.get('page', '?')})")
 
         col_raw, col_mapped = st.columns(2)
         with col_raw:
-            st.write("**Raw extracted data**")
-            if headers:
-                df_raw = pd.DataFrame(rows, columns=headers if len(headers) == len(rows[0]) else None)
+            if file_bytes:
+                img = render_page(file_bytes, page_num_0)
+                if img:
+                    st.image(img, caption=f"Page {page_num_0 + 1}", use_container_width=True)
+                else:
+                    st.dataframe(_safe_dataframe(headers, rows), use_container_width=True)
             else:
-                df_raw = pd.DataFrame(rows)
-            st.dataframe(df_raw, use_container_width=True)
+                st.write("**Raw extracted data**")
+                st.dataframe(_safe_dataframe(headers, rows), use_container_width=True)
 
         with col_mapped:
             st.write("**Mapping proposal**")
-            mapping_key = f"mapping_{document_id}_{idx}"
-            if mapping_key not in st.session_state:
-                with st.spinner("Asking AI for mapping..."):
-                    proposal = ai_extractor.propose_mapping(tbl, ticker, doc_type)
-                    st.session_state[mapping_key] = proposal or {}
-
-            proposal = st.session_state[mapping_key]
-
             if not proposal:
                 st.info("AI did not identify financial data in this table.")
                 continue
@@ -121,7 +202,7 @@ def _run_review_ui(tables, doc_type, ticker, document_id, session_factory):
             row_mappings = proposal.get("row_mappings", {})
             period_columns = proposal.get("period_columns", headers)
 
-            st.write(f"Period columns: `{', '.join(period_columns)}`")
+            st.write(f"Period columns: `{', '.join(str(p) for p in period_columns)}`")
 
             edited_mappings = {}
             for row_label, line_type in row_mappings.items():
@@ -221,10 +302,11 @@ def _persist_table(tables, row_mappings, period_columns, ticker, doc_type, docum
 
 with tab_pdf:
     st.subheader("Upload PDF Report")
-    c1, c2, c3 = st.columns(3)
-    pdf_ticker = c1.selectbox("Company", tickers, key="pdf_ticker")
-    pdf_doc_type = c2.selectbox("Document type", DOC_TYPES, key="pdf_doc_type")
-    pdf_period = c3.text_input("Period end date (YYYY-MM-DD)", key="pdf_period")
+    pdf_ticker = linked_company_selector(companies, key="pdf_co")
+    c1, c2 = st.columns(2)
+    pdf_doc_type = c1.selectbox("Document type", DOC_TYPES, key="pdf_doc_type")
+    _pdf_date = c2.date_input("Period end date", value=None, format="DD/MM/YYYY", key="pdf_period_dt")
+    pdf_period = _pdf_date.strftime("%Y-%m-%d") if _pdf_date else ""
     uploaded_file = st.file_uploader("PDF file", type=["pdf"])
 
     if uploaded_file and pdf_ticker and pdf_period:
@@ -233,7 +315,9 @@ with tab_pdf:
                 file_bytes = uploaded_file.read()
                 tables = extract_tables(file_bytes, uploaded_file.name)
                 st.session_state["pdf_tables"] = tables
+                st.session_state["pdf_file_bytes"] = file_bytes
                 st.session_state["pdf_doc_id"] = None
+                st.session_state.pop("pdf_tables_to_analyze", None)
 
             if tables:
                 with Session() as session:
@@ -252,20 +336,88 @@ with tab_pdf:
                 st.error("No tables found in PDF.")
 
     if st.session_state.get("pdf_tables") and st.session_state.get("pdf_doc_id"):
-        _run_review_ui(
-            st.session_state["pdf_tables"],
-            pdf_doc_type,
-            pdf_ticker,
-            st.session_state["pdf_doc_id"],
-            Session,
-        )
+        if not st.session_state.get("pdf_tables_to_analyze"):
+            all_tables = st.session_state["pdf_tables"]
+            auto_financial = {t["index"] for t in filter_junk_tables(all_tables)}
+            st.write(
+                f"**{len(all_tables)} tables found.** "
+                f"{len(auto_financial)} auto-detected as financial (pre-selected). "
+                f"Click 👁 to preview, adjust checkboxes, then **Analyse selected**."
+            )
+
+            sel_col, prev_col = st.columns([4, 6])
+
+            with sel_col:
+                ba, bn = st.columns(2)
+                if ba.button("Select all"):
+                    for t in all_tables:
+                        st.session_state[f"pdf_sel_{t['index']}"] = True
+                    st.rerun()
+                if bn.button("Deselect all"):
+                    for t in all_tables:
+                        st.session_state[f"pdf_sel_{t['index']}"] = False
+                    st.rerun()
+
+                for tbl in all_tables:
+                    idx = tbl["index"]
+                    page = tbl.get("page", "?")
+                    headers = tbl.get("headers", [])
+                    rows = tbl.get("rows", [])
+                    label = f"Table {idx + 1} (p.{page}) — {len(rows)}r × {len(headers)}c"
+                    chk_c, eye_c = st.columns([5, 1])
+                    with chk_c:
+                        st.checkbox(label, value=(idx in auto_financial), key=f"pdf_sel_{idx}")
+                    with eye_c:
+                        if st.button("👁", key=f"prev_btn_{idx}", help="Preview this table"):
+                            st.session_state["pdf_preview_idx"] = idx
+                            st.rerun()
+
+                st.divider()
+                if st.button("Analyse selected tables", type="primary"):
+                    selected = [t for t in all_tables if st.session_state.get(f"pdf_sel_{t['index']}", False)]
+                    if selected:
+                        st.session_state["pdf_tables_to_analyze"] = selected
+                        st.rerun()
+                    else:
+                        st.warning("No tables selected.")
+
+            with prev_col:
+                pidx = st.session_state.get("pdf_preview_idx")
+                if pidx is not None:
+                    ptbl = next((t for t in all_tables if t["index"] == pidx), None)
+                    if ptbl:
+                        st.write(f"**Table {pidx + 1} — page {ptbl.get('page', '?')}**")
+                        fb = st.session_state.get("pdf_file_bytes")
+                        if fb:
+                            img = render_page(fb, ptbl.get("page", 1) - 1)
+                            if img:
+                                st.image(img, use_container_width=True)
+                            else:
+                                st.dataframe(_safe_dataframe(ptbl.get("headers", []), ptbl.get("rows", [])), use_container_width=True)
+                        else:
+                            st.dataframe(_safe_dataframe(ptbl.get("headers", []), ptbl.get("rows", [])), use_container_width=True)
+                else:
+                    st.info("Click 👁 next to a table to preview it here.")
+        else:
+            if st.button("← Back to table selection"):
+                st.session_state.pop("pdf_tables_to_analyze", None)
+                st.rerun()
+            _run_review_ui(
+                st.session_state["pdf_tables_to_analyze"],
+                pdf_doc_type,
+                pdf_ticker,
+                st.session_state["pdf_doc_id"],
+                Session,
+                file_bytes=st.session_state.get("pdf_file_bytes"),
+            )
 
 with tab_html:
     st.subheader("Fetch from URL")
-    c1, c2, c3 = st.columns(3)
-    html_ticker = c1.selectbox("Company", tickers, key="html_ticker")
-    html_doc_type = c2.selectbox("Document type", DOC_TYPES, key="html_doc_type")
-    html_period = c3.text_input("Period end date (YYYY-MM-DD)", key="html_period")
+    html_ticker = linked_company_selector(companies, key="html_co")
+    c1, c2 = st.columns(2)
+    html_doc_type = c1.selectbox("Document type", DOC_TYPES, key="html_doc_type")
+    _html_date = c2.date_input("Period end date", value=None, format="DD/MM/YYYY", key="html_period_dt")
+    html_period = _html_date.strftime("%Y-%m-%d") if _html_date else ""
     url = st.text_input("URL (Investegate / LSE RNS / company IR page)")
 
     if url and html_ticker:

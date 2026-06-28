@@ -3,11 +3,17 @@ import pandas as pd
 
 from db.database import get_engine, get_session_factory
 from db.models import Company, CompanyNote, FinancialPeriod, FinancialLineItem, SharePrice
+from pages.ui_helpers import form_company_selectbox
 
 st.title("Portfolio")
 
 engine = get_engine()
 Session = get_session_factory(engine)
+
+
+class _Co:
+    __slots__ = ("ticker", "name")
+    def __init__(self, t, n): self.ticker, self.name = t, n
 
 
 def _company_summary_row(session, company):
@@ -57,14 +63,16 @@ with Session() as session:
         .order_by(Company.ticker)
         .all()
     )
-    all_tickers = [c.ticker for c in session.query(Company).order_by(Company.ticker).all()]
+    _all = session.query(Company).order_by(Company.ticker).all()
+    all_companies = [_Co(c.ticker, c.name or c.ticker) for c in _all]
+    portfolio_tickers = [c.ticker for c in portfolio]
 
 col_left, col_right = st.columns([3, 1])
 
 with col_right:
     st.subheader("Add to portfolio")
     with st.form("add_portfolio"):
-        add_ticker = st.selectbox("Ticker", [""] + all_tickers)
+        add_ticker = form_company_selectbox(all_companies, key="port_add", label="Company", include_blank=True)
         if st.form_submit_button("Add") and add_ticker:
             with Session() as session:
                 c = session.get(Company, add_ticker)
@@ -82,7 +90,10 @@ with col_left:
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        remove_ticker = st.selectbox("Remove from portfolio", [""] + [c.ticker for c in portfolio])
+        port_cos = [_Co(c.ticker, c.name or c.ticker) for c in portfolio]
+        port_opts = [""] + [f"{c.ticker} — {c.name}" for c in sorted(port_cos, key=lambda x: x.name)]
+        remove_sel = st.selectbox("Remove from portfolio", port_opts, key="port_remove")
+        remove_ticker = remove_sel.split(" — ")[0] if remove_sel else ""
         if st.button("Remove") and remove_ticker:
             with Session() as session:
                 c = session.get(Company, remove_ticker)
@@ -93,7 +104,9 @@ with col_left:
 
 st.divider()
 st.subheader("Investment Notes")
-note_ticker = st.selectbox("Company", [""] + [c.ticker for c in portfolio], key="port_note_sel")
+_note_opts = [""] + [f"{c.ticker} — {c.name or c.ticker}" for c in sorted(portfolio, key=lambda x: x.name or x.ticker)]
+_note_sel = st.selectbox("Company", _note_opts, key="port_note_sel")
+note_ticker = _note_sel.split(" — ")[0] if _note_sel else ""
 if note_ticker:
     with st.form("add_note_port"):
         note_text = st.text_area("Note", height=80)

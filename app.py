@@ -9,13 +9,14 @@ st.set_page_config(
     layout="wide",
 )
 
-from db.database import get_engine, get_session_factory, init_db
+from db.database import get_engine, get_session_factory, init_db, run_migrations
 
 
 @st.cache_resource
 def setup_db():
     engine = get_engine()
     init_db(engine)
+    run_migrations(engine)
     return engine
 
 

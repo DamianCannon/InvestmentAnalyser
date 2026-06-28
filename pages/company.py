@@ -12,6 +12,7 @@ from db.models import (
     Document, CompanyType, PeriodType
 )
 from metrics.calculator import build_metrics_table, LINE_ITEM_LABELS, METRIC_LABELS
+from pages.ui_helpers import linked_company_selector
 
 st.title("Company Analysis")
 
@@ -30,13 +31,20 @@ def _find_closest_price(price_map, date_str):
 
 
 with Session() as session:
-    tickers = [c.ticker for c in session.query(Company).order_by(Company.ticker).all()]
+    _all_cos = session.query(Company).order_by(Company.ticker).all()
+    tickers = [c.ticker for c in _all_cos]
+
+    class _Co:
+        __slots__ = ("ticker", "name")
+        def __init__(self, t, n): self.ticker, self.name = t, n
+
+    companies = [_Co(c.ticker, c.name or c.ticker) for c in _all_cos]
 
 if not tickers:
     st.info("No companies in database. Add companies via the Universe or Ingest pages.")
     st.stop()
 
-ticker = st.selectbox("Select company", tickers)
+ticker = linked_company_selector(companies, key="company_co")
 
 with Session() as session:
     company = session.get(Company, ticker)
